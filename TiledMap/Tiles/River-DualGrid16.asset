@@ -1,0 +1,37 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: e78c77a76e2f4b428c03246a58e52150, type: 3}
+  m_Name: River-DualGrid16
+  m_EditorClassIdentifier: 
+  displayName: River
+  tint: {r: 1, g: 1, b: 1, a: 1}
+  materialTemplate: {fileID: 2100000, guid: fec4224e273bc524fbbc3662776e4e0c, type: 2}
+  tileType: 0
+  maskVariants: []
+  tiles:
+  - {fileID: -938984633, guid: 2f656f0a72dc2e441855ffa8d3fa9b96, type: 3}
+  - {fileID: 678674263, guid: 2f656f0a72dc2e441855ffa8d3fa9b96, type: 3}
+  - {fileID: -47888844, guid: 2f656f0a72dc2e441855ffa8d3fa9b96, type: 3}
+  - {fileID: 1556068260, guid: 2f656f0a72dc2e441855ffa8d3fa9b96, type: 3}
+  - {fileID: 1462211886, guid: 2f656f0a72dc2e441855ffa8d3fa9b96, type: 3}
+  - {fileID: 1078308190, guid: 2f656f0a72dc2e441855ffa8d3fa9b96, type: 3}
+  - {fileID: 1830711653, guid: 2f656f0a72dc2e441855ffa8d3fa9b96, type: 3}
+  - {fileID: 671033247, guid: 2f656f0a72dc2e441855ffa8d3fa9b96, type: 3}
+  - {fileID: 938463081, guid: 2f656f0a72dc2e441855ffa8d3fa9b96, type: 3}
+  - {fileID: 921804877, guid: 2f656f0a72dc2e441855ffa8d3fa9b96, type: 3}
+  - {fileID: -1930731843, guid: 2f656f0a72dc2e441855ffa8d3fa9b96, type: 3}
+  - {fileID: -853710667, guid: 2f656f0a72dc2e441855ffa8d3fa9b96, type: 3}
+  - {fileID: 1576892856, guid: 2f656f0a72dc2e441855ffa8d3fa9b96, type: 3}
+  - {fileID: -547429171, guid: 2f656f0a72dc2e441855ffa8d3fa9b96, type: 3}
+  - {fileID: 167613163, guid: 2f656f0a72dc2e441855ffa8d3fa9b96, type: 3}
+  - {fileID: -1206935403, guid: 2f656f0a72dc2e441855ffa8d3fa9b96, type: 3}
+  sourceTileset: {fileID: 2800000, guid: 2f656f0a72dc2e441855ffa8d3fa9b96, type: 3}

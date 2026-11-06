@@ -1,0 +1,81 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!21 &2100000
+Material:
+  serializedVersion: 8
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_Name: GameGridTileWater
+  m_Shader: {fileID: 4800000, guid: 7e0f81d0a37b458a905a19d0bac4a30b, type: 3}
+  m_Parent: {fileID: 0}
+  m_ModifiedSerializedProperties: 0
+  m_ValidKeywords: []
+  m_InvalidKeywords:
+  - _USEHEIGHTMAP_ON
+  m_LightmapFlags: 4
+  m_EnableInstancingVariants: 0
+  m_DoubleSidedGI: 0
+  m_CustomRenderQueue: -1
+  stringTagMap: {}
+  disabledShaderPasses: []
+  m_LockedProperties: 
+  m_SavedProperties:
+    serializedVersion: 3
+    m_TexEnvs:
+    - _CausticHighlightTexture:
+        m_Texture: {fileID: 2800000, guid: 336b5e70bdcbf8047b84d3ba70c0899a, type: 3}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    - _CausticTexture:
+        m_Texture: {fileID: 2800000, guid: eb179c85242d5d942aca57cd4eebf850, type: 3}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    - _FoamTexture:
+        m_Texture: {fileID: 2800000, guid: eb179c85242d5d942aca57cd4eebf850, type: 3}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    - _HeightMap:
+        m_Texture: {fileID: 2800000, guid: 1bf9265d50b240f4d80ee64b41806009, type: 3}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    - _MainTex:
+        m_Texture: {fileID: 2800000, guid: c15dc4d84d350e242ad1354aa579d8e0, type: 3}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    m_Ints: []
+    m_Floats:
+    - _CausticFaderMultiplier: 0.3
+    - _CausticFaderScale: 0.17
+    - _CausticMovementAmount: 0.03
+    - _CausticMovementScale: 5
+    - _CausticScale: 0.43
+    - _CausticSpeed: 0.5
+    - _CausticSquashAmount: 1.94
+    - _CurrentWorldTextureScale: 0.05
+    - _FoamBlurAmount: 13.1
+    - _FoamScale: 0.16
+    - _Pixelization: 64
+    - _ShoreWidth: 0.03
+    - _SpecularScale: 8.61
+    - _SpecularScale2: 3.68
+    - _SpecularSpeed: 0.3
+    - _SpecularThreshold: -0.76
+    - _UseHeightMap: 1
+    - _UseWaterLevel: 0
+    - _WaterLevel: 0.3853
+    m_Colors:
+    - _CausticColour: {r: 0.45490196, g: 0.77254903, b: 0.7647059, a: 0.25490198}
+    - _CausticHighlightColour: {r: 1, g: 1, b: 1, a: 0.36862746}
+    - _Color: {r: 1, g: 1, b: 1, a: 1}
+    - _CurrentWorldTexturePos: {r: 0, g: 0, b: 0, a: 0}
+    - _CurrentWorldTextureScaleXY: {r: 0, g: 0, b: 0, a: 0}
+    - _Flip: {r: 1, g: 1, b: 1, a: 1}
+    - _FoamColour: {r: 1, g: 1, b: 1, a: 1}
+    - _FoamTexelSize: {r: 0.00390625, g: 0.00390625, b: 0, a: 0}
+    - _MainColour: {r: 0.24252, g: 0.5171283, b: 0.645, a: 0.48235294}
+    - _RendererColor: {r: 1, g: 1, b: 1, a: 1}
+    - _SpecularColour: {r: 1, g: 1, b: 1, a: 0.87058824}
+  m_BuildTextureStacks: []
+  m_AllowLocking: 1
