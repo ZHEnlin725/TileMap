@@ -12,13 +12,13 @@ public sealed class GameGridRendererEditor : Editor
 {
     private const string ItemContainerName = "__Grid_Items";
 
-    private SerializedProperty widthProperty;
-    private SerializedProperty heightProperty;
     private SerializedProperty cellSizeProperty;
     private SerializedProperty tileTypeProperty;
+    private SerializedProperty sortOrderProperty;
     private SerializedProperty isometricTileSizeProperty;
     private SerializedProperty isometricLevelsProperty;
     private SerializedProperty isometricLevelHeightProperty;
+    private SerializedProperty tileRecycleDelayProperty;
     private SerializedProperty terrainLayersProperty;
     private ReorderableList terrainLayersList;
 
@@ -34,13 +34,13 @@ public sealed class GameGridRendererEditor : Editor
 
     private void OnEnable()
     {
-        widthProperty = serializedObject.FindProperty("width");
-        heightProperty = serializedObject.FindProperty("height");
         cellSizeProperty = serializedObject.FindProperty("cellSize");
         tileTypeProperty = serializedObject.FindProperty("tileType");
+        sortOrderProperty = serializedObject.FindProperty("sortOrder");
         isometricTileSizeProperty = serializedObject.FindProperty("isometricTileSize");
         isometricLevelsProperty = serializedObject.FindProperty("isometricLevels");
         isometricLevelHeightProperty = serializedObject.FindProperty("isometricLevelHeight");
+        tileRecycleDelayProperty = serializedObject.FindProperty("tileRecycleDelay");
         terrainLayersProperty = serializedObject.FindProperty("terrainLayers");
         terrainLayersList = new ReorderableList(
             serializedObject,
@@ -75,14 +75,13 @@ public sealed class GameGridRendererEditor : Editor
 
         DrawScenePanel();
 
-        if (!renderer.EditorPaintMode) painting = false;
         if (!renderer.EditorItemMode)
         {
             itemPainting = false;
             HideItemPreview();
         }
 
-        if (!renderer.EditorPaintMode && !renderer.EditorItemMode)
+        if (renderer.EditorItemMode)
         {
             return;
         }
@@ -170,8 +169,8 @@ public sealed class GameGridRendererEditor : Editor
 
         EditorGUILayout.LabelField("Grid", EditorStyles.boldLabel);
         EditorGUILayout.PropertyField(tileTypeProperty, new GUIContent("Tile Type"));
-        EditorGUILayout.PropertyField(widthProperty);
-        EditorGUILayout.PropertyField(heightProperty);
+        EditorGUILayout.PropertyField(sortOrderProperty, new GUIContent("Sort Order"));
+        DrawGridSizeFields(renderer);
         if (renderer.IsIsometric)
         {
             EditorGUILayout.PropertyField(
@@ -186,6 +185,14 @@ public sealed class GameGridRendererEditor : Editor
         {
             EditorGUILayout.PropertyField(cellSizeProperty);
         }
+
+        EditorGUILayout.Space(6f);
+        EditorGUILayout.LabelField("Runtime Tiles", EditorStyles.boldLabel);
+        EditorGUILayout.PropertyField(
+            tileRecycleDelayProperty,
+            new GUIContent(
+                "Tile Recycle Delay",
+                "Seconds before tiles outside the visible range are recycled into the pool."));
 
         EditorGUILayout.Space(6f);
         terrainLayersList.DoLayoutList();
@@ -203,6 +210,23 @@ public sealed class GameGridRendererEditor : Editor
         }
 
         DrawTools(renderer);
+    }
+
+    private static void DrawGridSizeFields(GameGridRenderer renderer)
+    {
+        // Delayed on purpose: resizing reallocates all layer cells and
+        // rebuilds the preview, which should only happen on commit (Enter or
+        // focus loss), not on every keystroke.
+        EditorGUI.BeginChangeCheck();
+        var newWidth = EditorGUILayout.DelayedIntField(new GUIContent("Width"), renderer.Width);
+        var newHeight = EditorGUILayout.DelayedIntField(new GUIContent("Height"), renderer.Height);
+        if (!EditorGUI.EndChangeCheck()) return;
+
+        Undo.RecordObject(renderer, "Resize Grid");
+        renderer.Resize(newWidth, newHeight);
+        EditorUtility.SetDirty(renderer);
+        renderer.Rebuild();
+        SceneView.RepaintAll();
     }
 
     [MenuItem("GameObject/2D Object/Game Grid Renderer", false, 30)]
@@ -236,9 +260,7 @@ public sealed class GameGridRendererEditor : Editor
         element.FindPropertyRelative("sortingOrder").intValue = 0;
         renderer.EditorBrushLayerIndex = index;
         EditorUtility.SetDirty(renderer);
-        renderer.EnsureLayerData(false);     
-        var cellsProperty = element.FindPropertyRelative("cells");
-        cellsProperty.ClearArray();
+        renderer.EnsureLayerData(false);
         serializedObject.ApplyModifiedProperties();
         renderer.Rebuild();
         GUI.changed = true;
@@ -257,8 +279,6 @@ public sealed class GameGridRendererEditor : Editor
         element.FindPropertyRelative("sortingOrder").intValue = 0;
         renderer.EditorBrushLayerIndex = index;
         renderer.EnsureLayerData(false);
-        var cellsProperty = element.FindPropertyRelative("cells");
-        cellsProperty.ClearArray();
         serializedObject.ApplyModifiedProperties();
         EditorUtility.SetDirty(renderer);
         GUI.changed = true;
@@ -432,21 +452,10 @@ public sealed class GameGridRendererEditor : Editor
             SceneView.RepaintAll();
         }
 
-        var paintMode = EditorGUILayout.ToggleLeft("Paint Mode", renderer.EditorPaintMode);
-        if (paintMode != renderer.EditorPaintMode)
-        {
-            renderer.EditorPaintMode = paintMode;
-            if (paintMode) renderer.EditorItemMode = false;
-            EditorUtility.SetDirty(renderer);
-            renderer.Rebuild();
-            SceneView.RepaintAll();
-        }
-
         var itemMode = EditorGUILayout.ToggleLeft("Item Mode (Place Props)", renderer.EditorItemMode);
         if (itemMode != renderer.EditorItemMode)
         {
             renderer.EditorItemMode = itemMode;
-            if (itemMode) renderer.EditorPaintMode = false;
             EditorUtility.SetDirty(renderer);
             SceneView.RepaintAll();
         }
