@@ -8,8 +8,8 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `GameGridRenderer.cs` | 核心渲染器（MonoBehaviour）。持有网格尺寸/层数、terrainLayers 数据，负责 mask 计算、静态地形合批、AnimatedTile 生成与清理、编辑器 paintMode 预览。 |
-| `GameGridTerrainLayer.cs` | 单个地形层的数据容器：TileSet 引用 + `bool[] cells`（按 `z*width*height + y*width + x` 索引）、排序设置。内含被注释掉的 bit 压缩存储方案。 |
+| `GameGridRenderer.cs` | 核心渲染器（MonoBehaviour）。持有网格尺寸/层数、terrainLayers 数据，负责 mask 计算、静态地形合批、AnimatedTile 生成与清理、编辑器 paintMode 预览；支持 SortOrder 排序；运行时改用 ShowRange + 对象池的单 Tile Renderer 加载。 |
+| `GameGridTerrainLayer.cs` | 单个地形层的数据容器：TileSet 引用 + 位压缩 `byte[] cells`（每 byte 存 8 格，按 `z*width*height + y*width + x` 的位索引）、排序设置；含旧版逐格存储迁移。 |
 | `GameGridTileSet.cs` | TileSet 抽象基类（ScriptableObject）。定义 `GameGridTileSetMode`、`MaskTileVariant`（随机变体/帧动画）、`Resolve(mask, position)` 统一入口。 |
 | `DualGrid16TileSet.cs` | Dual Grid 模式：16 张图，sprite 放在格子角上，由周围 4 个数据格决定。`UsesCornerLayout = true`。含 `SliceToTileSlot` 贴图槽位映射。 |
 | `Blob47TileSet.cs` | Blob 模式：47 张图，sprite 放在格子中心，由 8 邻居 mask 决定。含 256 种 mask 到 47 规范形的 `CanonicalizeBlobMask` 归一化。 |
@@ -31,21 +31,75 @@
 ## 核心数据流
 
 1. **数据存储**：`GameGridRenderer.terrainLayers` 每层一个 `GameGridTerrainLayer`，
-   `cells` 是 `bool[width * height * LevelCount]`，索引 `GetCellIndex(x, y, z)`。
+   `cells` 是位压缩 `byte[ceil(width * height * LevelCount / 8)]`，
+   全局位索引 `GetCellIndex(x, y, z)`，读写在 `GameGridTerrainLayer` 内完成
+   （byte: `index >> 3`，bit: `index & 7`）。
 2. **Rebuild**：`GameGridRenderer.Rebuild()` 先 `ClearGenerated()` 再逐层 `BuildTerrain`。
-   编辑器下只有 `Application.isPlaying` 或 `editorPaintMode` 才真正构建，否则只清空预览。
+   编辑模式下默认就是绘制预览，`Rebuild` 直接构建；运行时走 `ShowRange` 对象池。
 3. **Mask 计算**：
    - Corner 布局（DualGrid16）：遍历 `(width+1) * (height+1)` 个角点，
      用周围 4 格拼出 0-15 的 mask（`BuildDualGridTerrain`）。
    - Blob / Custom 布局：遍历每个被占用的格子，用 8 邻居拼 mask（`BuildBlobTerrain` + `GetBlobMask`）。
 4. **解析 Sprite**：`set.Resolve(mask, cellPos)` 先查 `maskVariants`（随机变体或帧动画），
-   没有命中再走子类的 `GetTileForMask(mask)`。
+   没有命中再走子类的 `GetTileForMask(mask)`。随机变体用整数雪崩哈希
+   （seed ^ mask ^ 格子坐标）直接取模选图，逐格确定且零 GC 分配。
 5. **渲染**：
    - 静态格子按 Sprite 纹理分组（`Dictionary<Texture2D, MeshBuffers>`），
      合并为一个 GameObject 的多 subMesh Mesh（`CreateTerrainObject`），
      每个纹理一个材质（`CreateMaterial`）。
    - 动画格子不走合批，`CreateAnimatedTile` 生成独立对象 + `SpriteRenderer` +
      `GameGridAnimatedTile`，用 TileSet 的 `materialTemplate` 直接赋 `sharedMaterial`。
+
+## SortOrder
+
+`GameGridRenderer.sortOrder` 参考 TileMap 提供四种排序起点：`BottomLeft`（默认）、
+`BottomRight`、`TopLeft`、`TopRight`。它决定等距模式下 Tile 的绘制起点方向
+（从哪个角开始向对面角排序），默认 `BottomLeft` 与旧行为（按 `x + y` 升序）完全一致。
+编辑器画图预览的合批 Mesh 按此排序；运行时的单 Tile Renderer 则直接把
+`(layer.sortingOrder + z) * (width + height + 2) + sortDepth` 写进每个 Tile 的
+`sortingOrder`，保证跨位置遮挡正确。矩形模式格子互不重叠，SortOrder 不产生可见差异。
+
+## 运行时单 Tile Renderer + 对象池
+
+编辑器（paintMode 预览）仍走合批 Mesh；**运行时不再自动构建全部 Tile**，
+每个 Tile 是一个独立的 `SpriteRenderer`（动画 Tile 额外带 `GameGridAnimatedTile`），
+由对象池管理：
+
+- `ShowRange(minX, minY, maxX, maxY)`：显示范围内的 Tile（按格子坐标；
+  Dual Grid 角点布局会外扩一圈角点保证接缝完整）。重复传入相同范围不会重复扫描；
+  范围变化时只扫描新增的边缘行列（与上次范围的增量 diff），离开范围的部分
+  由标记逻辑处理，全量扫描只发生在首次显示、全量刷新和空范围时。
+- 离开范围后 Tile 不会立刻回收，`tileRecycleDelay` 秒后（Inspector 可调，
+  默认 5s）回收进对象池；期间重新进入范围则取消回收。没有待回收 Tile 时
+  跳过每帧回收扫描。
+- 创建 Tile 时优先从池里取（静态/动画 GameObject 分别一个池，
+  `RuntimeTile` 状态对象单独池化复用），池空才 `new`；GameObject 池有
+  2048 的软上限，超限后回收直接销毁不再入池。
+- 回收使用 swap-and-pop（O(1)），`List.Remove` 的整表查找已移除。
+- `HideRangeTiles()` 立即回收全部可见 Tile；`VisibleTileCount` /
+  `HasVisibleRange` 可用于调试。
+
+用法：
+
+```csharp
+// 相机跟随处每帧调用（范围不变时内部会跳过重建）
+renderer.ShowRange(
+    minCell.x, minCell.y,
+    minCell.x + visibleCells.x - 1,
+    minCell.y + visibleCells.y - 1);
+```
+
+注意事项：
+
+- 运行时 `SetCell/SetCells` 写入数据后总是增量刷新受影响 Tile 的 sprite/mask
+  （只刷受影响的 3x3 / 角点区域）；`Fill/Clear/Rebuild` 会回收全部并按当前
+  范围重建。`rebuild` 参数只影响编辑期行为。
+- 单 Tile Renderer 的 Draw Call 与范围内 Tile 数成正比，建议范围只覆盖
+  屏幕视野；大地图 + 大范围时建议后续再叠加分块合批。
+- 等距模式下每个 Tile 的 `sortingOrder` 包含 `sortDepth`，排序值上限约为
+  `(layer.sortingOrder + z) * (width + height + 2) + width + height`，
+  layer.sortingOrder 不要设置过大。
+- 编辑器下调用 `ShowRange` 会被忽略并警告一次（编辑模式走画图预览）。
 
 ## 关键约定与陷阱
 
@@ -59,8 +113,9 @@
   登记进 `generatedMaterials` 统一销毁，模板材质不会被清理。
   AnimatedTile 用 `SpriteRenderer`，直接引用模板材质即可。
 - **cell 索引**：`z * width * height + y * width + x`；改尺寸走 `Resize` /
-  `EnsureData` 的内容保留拷贝。`cells` 目前是 `bool[]`，bit 压缩方案在
-  `GameGridTerrainLayer.cs` 中以注释形式保留。
+  `EnsureData` 的内容保留拷贝（`ResizeLayerCells` 按位逐个搬运，行起点不按
+  字节对齐）。`cells` 为位压缩 `byte[]`；旧场景的逐格 0/1 数据会在
+  `EnsureData` 时经 `TryMigrateLegacyCells` 自动转换。
 - **mask 位定义**：Blob 的 8 邻居位是 `N=1, NE=2, E=4, SE=8, S=16, SW=32, W=64, NW=128`；
   DualGrid 的角点 mask 是 bit0=左下、bit1=右下、bit2=左上、bit3=右上。
 - **槽位映射**：Blob47/DualGrid16 的 `blobTiles` / `tiles` 数组按“源图集切片顺序”
