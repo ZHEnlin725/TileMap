@@ -90,12 +90,18 @@ public abstract class GameGridTileSet : ScriptableObject
             if (mode == MaskTileVariantMode.Animation) return sprites[0];
 
             // Keep the editor-configured seed as the root, then salt it by cell
-            // position so identical masks still vary across the map.
+            // position so identical masks still vary across the map. A cheap
+            // integer avalanche avoids allocating a System.Random per tile.
             var seed = (int)((long)randomSeed ^ ((long)mask * 2654435761L));
-            seed ^= position.x * 73856093;
-            seed ^= position.y * 19349663;
-            var prng = new System.Random(seed);
-            return sprites[prng.Next(0, sprites.Length)];
+            var hash = (uint)seed;
+            hash ^= (uint)(position.x * 73856093);
+            hash ^= (uint)(position.y * 19349663);
+            hash ^= hash >> 16;
+            hash *= 0x7feb352d;
+            hash ^= hash >> 15;
+            hash *= 0x846ca68b;
+            hash ^= hash >> 16;
+            return sprites[hash % (uint)sprites.Length];
         }
 
         public bool TryResolve(Vector2Int position, out GameGridTileSelection selection)
