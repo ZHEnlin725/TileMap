@@ -9,10 +9,20 @@ public enum GameGridTileType
     Isometric
 }
 
+public enum GameGridSortOrder
+{
+    BottomLeft = 0,
+    BottomRight = 1,
+    TopLeft = 2,
+    TopRight = 3
+}
+
 /// <summary>
 /// Renders a cell-based terrain grid on the grid: one tile is placed on each
 /// cell corner and is selected from the four surrounding data cells. Out-of-range
 /// cells are treated as empty.
+/// Edit mode builds merged preview meshes for painting; at runtime tiles are
+/// individual pooled renderers driven by <see cref="GameGridRenderer.ShowRange"/>.
 /// </summary>
 [ExecuteAlways]
 [DisallowMultipleComponent]
@@ -21,6 +31,7 @@ public sealed class GameGridRenderer : MonoBehaviour
 {
     private const string GeneratedPrefix = "__Grid_";
     private const int LargeMeshVertexCount = 65000;
+    private const int MaxPooledTileObjects = 2048;
     private const float Epsilon = 0.0001f;
     private static readonly int MainTexProperty = Shader.PropertyToID("_MainTex");
     private static Shader defaultSpriteShader;
@@ -31,9 +42,13 @@ public sealed class GameGridRenderer : MonoBehaviour
     [SerializeField, Min(Epsilon)] private float cellSize = .125f;
     [SerializeField] private bool renderInEditMode = true;
     [SerializeField] private GameGridTileType tileType = GameGridTileType.Rectangle;
+    [SerializeField] private GameGridSortOrder sortOrder = GameGridSortOrder.BottomLeft;
     [SerializeField] private Vector2 isometricTileSize = new Vector2(1f, 0.5f);
     [SerializeField, Min(1)] private int isometricLevels = 1;
     [SerializeField, Min(Epsilon)] private float isometricLevelHeight = 0.5f;
+
+    [Header("Runtime Tiles")]
+    [SerializeField, Min(0)] private float tileRecycleDelay = 5f;
 
     [Header("Terrain")] [SerializeField]
     private List<GameGridTerrainLayer> terrainLayers = new List<GameGridTerrainLayer>();
@@ -42,8 +57,6 @@ public sealed class GameGridRenderer : MonoBehaviour
     [SerializeField, HideInInspector] private int cellsHeight;
 
 #if UNITY_EDITOR
-    [SerializeField, HideInInspector] private bool editorPaintMode;
-
     [SerializeField, HideInInspector] private bool editorItemMode;
     [SerializeField, HideInInspector] private int editorBrushLayerIndex = -1;
     [SerializeField, HideInInspector] private int editorBrushZ;
@@ -56,7 +69,28 @@ public sealed class GameGridRenderer : MonoBehaviour
     private readonly List<GameObject> generatedObjects = new List<GameObject>();
     private readonly List<Mesh> generatedMeshes = new List<Mesh>();
     private readonly List<Material> generatedMaterials = new List<Material>();
+    private readonly List<RuntimeTile> activeTiles = new List<RuntimeTile>();
+    private readonly Dictionary<(int layerIndex, int z, int x, int y), RuntimeTile> activeTileMap =
+        new Dictionary<(int layerIndex, int z, int x, int y), RuntimeTile>();
+    private readonly List<GameObject> staticTilePool = new List<GameObject>();
+    private readonly List<GameObject> animatedTilePool = new List<GameObject>();
+    private readonly List<RuntimeTile> runtimeTilePool = new List<RuntimeTile>();
+    private readonly Dictionary<Material, Dictionary<Texture2D, Material>> tileMaterialCache =
+        new Dictionary<Material, Dictionary<Texture2D, Material>>();
+    private readonly List<Vector2Int> changedCellScratch = new List<Vector2Int>();
+    private int rangeMinX;
+    private int rangeMinY;
+    private int rangeMaxX = -1;
+    private int rangeMaxY = -1;
+    private bool hasRange;
+    private bool warnedShowRangeInEditMode;
     private bool rebuildPending;
+    private bool hasPreviousShowRange;
+    private int prevShowMinX;
+    private int prevShowMaxX;
+    private int prevShowMinY;
+    private int prevShowMaxY;
+    private int pendingRecycleCount;
 
     public int Width => width;
     public int Height => height;
@@ -70,6 +104,28 @@ public sealed class GameGridRenderer : MonoBehaviour
 
     public IReadOnlyList<GameGridTerrainLayer> TerrainLayers => terrainLayers;
 
+    public GameGridSortOrder SortOrder
+    {
+        get => sortOrder;
+        set
+        {
+            if (sortOrder == value) return;
+            sortOrder = value;
+            Rebuild();
+        }
+    }
+
+    /// <summary>Seconds a tile stays alive after leaving the visible range.</summary>
+    public float TileRecycleDelay
+    {
+        get => tileRecycleDelay;
+        set => tileRecycleDelay = Mathf.Max(0f, value);
+    }
+
+    public bool HasVisibleRange => hasRange;
+
+    public int VisibleTileCount => activeTiles.Count;
+
     public bool IsTileSetCompatible(GameGridTileSet set)
     {
         return set != null &&
@@ -77,12 +133,6 @@ public sealed class GameGridRenderer : MonoBehaviour
     }
 
 #if UNITY_EDITOR
-    public bool EditorPaintMode
-    {
-        get => editorPaintMode;
-        set => editorPaintMode = value;
-    }
-
     public bool EditorItemMode
     {
         get => editorItemMode;
@@ -113,6 +163,53 @@ public sealed class GameGridRenderer : MonoBehaviour
         set => editorShowGrid = value;
     }
 #endif
+
+    /// <summary>
+    /// Shows every tile whose grid position falls inside the cell rectangle
+    /// [minX..maxX] x [minY..maxY]. Corner-layout (dual grid) tiles extend one
+    /// corner beyond the rectangle so the covered cells stay seamless. Tiles
+    /// outside the range are recycled into the pool after
+    /// <see cref="TileRecycleDelay"/> seconds.
+    /// </summary>
+    public void ShowRange(int minX, int minY, int maxX, int maxY)
+    {
+        if (this == null) return;
+        if (!Application.isPlaying)
+        {
+#if UNITY_EDITOR
+            if (!warnedShowRangeInEditMode)
+            {
+                warnedShowRangeInEditMode = true;
+                Debug.LogWarning("GameGridRenderer.ShowRange only works at runtime; edit mode renders the paint preview.", this);
+            }
+#endif
+            return;
+        }
+
+        var changed = !hasRange ||
+                      minX != rangeMinX || minY != rangeMinY ||
+                      maxX != rangeMaxX || maxY != rangeMaxY;
+        rangeMinX = minX;
+        rangeMinY = minY;
+        rangeMaxX = maxX;
+        rangeMaxY = maxY;
+        hasRange = true;
+        if (changed) RefreshRangeTiles();
+    }
+
+    public void ShowRange(RectInt range)
+    {
+        ShowRange(range.xMin, range.yMin, range.xMax - 1, range.yMax - 1);
+    }
+
+    /// <summary>Recycles every visible tile immediately and clears the range.</summary>
+    public void HideRangeTiles()
+    {
+        if (this == null) return;
+        hasRange = false;
+        hasPreviousShowRange = false;
+        if (Application.isPlaying) RecycleAllTiles();
+    }
 
     public bool GetCell(GameGridTerrainLayer layer, int x, int y)
     {
@@ -153,7 +250,17 @@ public sealed class GameGridRenderer : MonoBehaviour
         if (layer.GetCell(index) == occupied) return false;
 
         layer.SetCell(index, occupied);
-        if (rebuild) Rebuild();
+        if (Application.isPlaying)
+        {
+            // Runtime tiles refresh incrementally around the changed cell;
+            // full range rescans are reserved for bulk rebuilds.
+            RefreshTilesForCellChange(layer, x, y, z);
+        }
+        else if (rebuild)
+        {
+            Rebuild();
+        }
+
         Changed?.Invoke();
         return true;
     }
@@ -171,6 +278,7 @@ public sealed class GameGridRenderer : MonoBehaviour
         EnsureData();
 
         var changed = 0;
+        changedCellScratch.Clear();
         foreach (var position in positions)
         {
             if (!InBounds(position.x, position.y, z)) continue;
@@ -178,10 +286,20 @@ public sealed class GameGridRenderer : MonoBehaviour
             if (layer.GetCell(index) == occupied) continue;
             layer.SetCell(index, occupied);
             changed++;
+            if (Application.isPlaying) changedCellScratch.Add(position);
         }
 
         if (changed == 0) return 0;
-        if (rebuild) Rebuild();
+        if (Application.isPlaying)
+        {
+            for (var i = 0; i < changedCellScratch.Count; i++)
+                RefreshTilesForCellChange(layer, changedCellScratch[i].x, changedCellScratch[i].y, z);
+        }
+        else if (rebuild)
+        {
+            Rebuild();
+        }
+
         Changed?.Invoke();
         return changed;
     }
@@ -387,12 +505,16 @@ public sealed class GameGridRenderer : MonoBehaviour
         if (this == null) return;
         rebuildPending = false;
         EnsureData();
+
+        if (Application.isPlaying)
+        {
+            // Runtime tiles are driven by ShowRange; a rebuild just re-shows
+            // the current range against fresh data.
+            RefreshVisibleTiles();
+            return;
+        }
+
         ClearGenerated();
-#if UNITY_EDITOR
-        if (!Application.isPlaying && !editorPaintMode) return;
-#else
-        if (!Application.isPlaying) return;
-#endif
         if (terrainLayers == null || terrainLayers.Count == 0) return;
 
         for (var i = 0; i < terrainLayers.Count; i++)
@@ -407,26 +529,34 @@ public sealed class GameGridRenderer : MonoBehaviour
     private void OnEnable()
     {
         EnsureData();
-        if (Application.isPlaying) Rebuild();
-        else rebuildPending = true;
+        if (Application.isPlaying)
+        {
+            if (hasRange) RefreshVisibleTiles();
+        }
+        else
+        {
+            rebuildPending = true;
+        }
     }
 
     private void OnDisable()
     {
+        ClearRuntimeTiles();
         ClearGenerated();
         rebuildPending = false;
     }
 
     private void Update()
     {
-#if UNITY_EDITOR
-        if (Application.isPlaying || !rebuildPending || !isActiveAndEnabled) return;
-        if (editorPaintMode) Rebuild();
-        else
+        if (Application.isPlaying)
         {
-            ClearGenerated();
-            rebuildPending = false;
+            ProcessTileRecycling();
+            return;
         }
+
+#if UNITY_EDITOR
+        if (!rebuildPending || !isActiveAndEnabled) return;
+        Rebuild();
 #endif
     }
 
@@ -440,6 +570,7 @@ public sealed class GameGridRenderer : MonoBehaviour
             Mathf.Max(Epsilon, isometricTileSize.y));
         isometricLevels = tileType == GameGridTileType.Isometric ? Mathf.Max(1, isometricLevels) : 1;
         isometricLevelHeight = Mathf.Max(Epsilon, isometricLevelHeight);
+        tileRecycleDelay = Mathf.Max(0f, tileRecycleDelay);
         if (terrainLayers != null)
         {
             for (var i = 0; i < terrainLayers.Count; i++)
@@ -545,6 +676,14 @@ public sealed class GameGridRenderer : MonoBehaviour
         return z * width * height + y * width + x;
     }
 
+    private int GetLayerIndex(GameGridTerrainLayer layer)
+    {
+        if (terrainLayers == null || layer == null) return -1;
+        for (var i = 0; i < terrainLayers.Count; i++)
+            if (ReferenceEquals(terrainLayers[i], layer)) return i;
+        return -1;
+    }
+
     private bool HasCell(GameGridTerrainLayer layer, int x, int y)
     {
         return HasCell(layer, x, y, 0);
@@ -560,7 +699,8 @@ public sealed class GameGridRenderer : MonoBehaviour
         width = Mathf.Max(1, width);
         height = Mathf.Max(1, height);
         var count = width * height * LevelCount;
-        if (cellsWidth == width && cellsHeight == height && LayersAreSized(count)) return;
+        var byteCount = (count + 7) >> 3;
+        if (cellsWidth == width && cellsHeight == height && LayersAreSized(byteCount)) return;
 
         var oldWidth = Mathf.Max(0, cellsWidth);
         var oldHeight = Mathf.Max(0, cellsHeight);
@@ -571,7 +711,7 @@ public sealed class GameGridRenderer : MonoBehaviour
             {
                 var layer = terrainLayers[i];
                 if (layer == null) continue;
-                ResizeLayerCells(layer, count, oldWidth, oldHeight, preserveContent);
+                ResizeLayerCells(layer, byteCount, oldWidth, oldHeight, preserveContent);
             }
         }
 
@@ -588,7 +728,6 @@ public sealed class GameGridRenderer : MonoBehaviour
             if (layer == null) continue;
             var cells = layer.Cells;
             if (cells == null || cells.Length != count) return false;
-            // if (layer.CellCount != count) return false;
         }
 
         return true;
@@ -596,21 +735,21 @@ public sealed class GameGridRenderer : MonoBehaviour
 
     private void ResizeLayerCells(
         GameGridTerrainLayer layer,
-        int count,
+        int byteCount,
         int oldWidth,
         int oldHeight,
         bool preserveContent)
     {
-        var resized = new bool[count];
+        var resized = new byte[byteCount];
         var oldCells = layer.Cells;
         var planeCount = width * height;
         var oldPlaneCount = oldWidth * oldHeight;
         var oldLevels = oldPlaneCount > 0 && oldCells is { Length: > 0 }
-            ? oldCells.Length / oldPlaneCount
+            ? (oldCells.Length << 3) / oldPlaneCount
             : 0;
-        var newLevels = count / Mathf.Max(1, planeCount);
+        var newLevels = planeCount > 0 ? (byteCount << 3) / planeCount : 0;
 
-        if (preserveContent && oldWidth > 0 && oldHeight > 0)
+        if (preserveContent && oldWidth > 0 && oldHeight > 0 && oldCells is { Length: > 0 })
         {
             var copyWidth = Mathf.Min(oldWidth, width);
             var copyHeight = Mathf.Min(oldHeight, height);
@@ -618,18 +757,23 @@ public sealed class GameGridRenderer : MonoBehaviour
             {
                 for (var y = 0; y < copyHeight; y++)
                 {
-                    Array.Copy(
-                        oldCells,
-                        z * oldPlaneCount + y * oldWidth,
-                        resized,
-                        z * planeCount + y * width,
-                        copyWidth);
+                    // Rows are bit-packed with the global index
+                    // z * plane + y * width, so row starts are generally not
+                    // byte aligned and must be copied bit by bit.
+                    var srcBitBase = z * oldPlaneCount + y * oldWidth;
+                    var dstBitBase = z * planeCount + y * width;
+                    for (var x = 0; x < copyWidth; x++)
+                    {
+                        var srcBit = srcBitBase + x;
+                        if ((oldCells[srcBit >> 3] & (1 << (srcBit & 7))) == 0) continue;
+                        var dstBit = dstBitBase + x;
+                        resized[dstBit >> 3] |= (byte)(1 << (dstBit & 7));
+                    }
                 }
             }
         }
 
         layer.ReplaceCells(resized);
-        // layer.ReplaceCompressedCells(resized, count % 8);
     }
 
     public void EnsureLayerData(bool rebuild = true)
@@ -744,7 +888,7 @@ public sealed class GameGridRenderer : MonoBehaviour
                     {
                         sprite = sprite,
                         anchor = anchor,
-                        depth = x + y,
+                        depth = GetSortDepth(x, y),
                         diagonal = x - y
                     });
                     continue;
@@ -804,7 +948,7 @@ public sealed class GameGridRenderer : MonoBehaviour
                     {
                         sprite = sprite,
                         anchor = anchor,
-                        depth = x + y,
+                        depth = GetSortDepth(x, y),
                         diagonal = x - y
                     });
                     continue;
@@ -862,6 +1006,17 @@ public sealed class GameGridRenderer : MonoBehaviour
                 draw.anchor,
                 tileSize,
                 tint);
+        }
+    }
+
+    private int GetSortDepth(int x, int y)
+    {
+        switch (sortOrder)
+        {
+            case GameGridSortOrder.BottomRight: return (width - x) + y;
+            case GameGridSortOrder.TopLeft: return x + (height - y);
+            case GameGridSortOrder.TopRight: return (width - x) + (height - y);
+            default: return x + y;
         }
     }
 
@@ -1032,12 +1187,12 @@ public sealed class GameGridRenderer : MonoBehaviour
         Dictionary<Texture2D, MeshBuffers> buffers,
         int z)
     {
-        //渲染方式可能需要修改 不再合成Mesh 单个Tile 单独渲染
+        // Edit-mode paint preview keeps merged meshes; runtime rendering uses
+        // the per-tile pool driven by ShowRange instead.
         var set = layer.TileSet;
         var objectName = GeneratedPrefix + set.SafeName + (z > 0 ? $"_Z{z}" : string.Empty);
         var meshObject = new GameObject(objectName)
         {
-            // hideFlags = HideFlags.DontSave | HideFlags.HideInHierarchy,
             layer = gameObject.layer
         };
         meshObject.transform.SetParent(transform, false);
@@ -1131,7 +1286,8 @@ public sealed class GameGridRenderer : MonoBehaviour
         if (defaultSpriteShader == null) defaultSpriteShader = Shader.Find("Sprites/Default");
         if (defaultSpriteShader == null)
             defaultSpriteShader = Shader.Find("Universal Render Pipeline/2D/Sprite-Lit-Default");
-        if (defaultSpriteShader == null) defaultSpriteShader = Shader.Find("Unlit/Texture");
+        if (defaultSpriteShader == null)
+            defaultSpriteShader = Shader.Find("Unlit/Texture");
         return defaultSpriteShader;
     }
 
@@ -1189,6 +1345,409 @@ public sealed class GameGridRenderer : MonoBehaviour
         }
     }
 
+    private void RefreshVisibleTiles()
+    {
+        RecycleAllTiles();
+        hasPreviousShowRange = false;
+        if (!hasRange) return;
+        RefreshRangeTiles();
+    }
+
+    private void RefreshRangeTiles()
+    {
+        if (terrainLayers == null) return;
+
+        var minX = Mathf.Max(0, rangeMinX);
+        var maxX = Mathf.Min(width - 1, rangeMaxX);
+        var minY = Mathf.Max(0, rangeMinY);
+        var maxY = Mathf.Min(height - 1, rangeMaxY);
+        var empty = minX > maxX || minY > maxY;
+        var levelCount = IsIsometric ? LevelCount : 1;
+
+        for (var i = 0; i < activeTiles.Count; i++)
+        {
+            var tile = activeTiles[i];
+            var layer = tile.layerIndex >= 0 && tile.layerIndex < terrainLayers.Count
+                ? terrainLayers[tile.layerIndex]
+                : null;
+            var inRange = !empty &&
+                          layer != null && layer.visible && layer.TileSet != null &&
+                          tile.z < levelCount &&
+                          tile.x >= minX && tile.x <= maxX &&
+                          tile.y >= minY && tile.y <= maxY;
+            if (inRange)
+            {
+                if (tile.outOfRangeTime >= 0f)
+                {
+                    tile.outOfRangeTime = -1f;
+                    pendingRecycleCount--;
+                }
+            }
+            else if (tile.outOfRangeTime < 0f)
+            {
+                tile.outOfRangeTime = Time.time;
+                pendingRecycleCount++;
+            }
+        }
+
+        if (empty)
+        {
+            hasPreviousShowRange = false;
+            return;
+        }
+
+        // Corner tiles one step beyond the rectangle keep the covered cells
+        // seamless, matching the map edge behavior.
+        var extendsCorners = HasCornerLayoutLayer();
+        var showMaxX = extendsCorners ? Mathf.Min(width, maxX + 1) : maxX;
+        var showMaxY = extendsCorners ? Mathf.Min(height, maxY + 1) : maxY;
+
+        if (hasPreviousShowRange && activeTiles.Count > 0)
+        {
+            // Only newly exposed rows and columns need a scan; tiles already in
+            // the map keep their configuration and exits were marked above.
+            if (minX < prevShowMinX)
+                ShowRangeRegion(minX, Mathf.Min(showMaxX, prevShowMinX - 1), minY, showMaxY, levelCount);
+            if (showMaxX > prevShowMaxX)
+                ShowRangeRegion(Mathf.Max(minX, prevShowMaxX + 1), showMaxX, minY, showMaxY, levelCount);
+            if (minY < prevShowMinY)
+                ShowRangeRegion(minX, showMaxX, minY, Mathf.Min(showMaxY, prevShowMinY - 1), levelCount);
+            if (showMaxY > prevShowMaxY)
+                ShowRangeRegion(minX, showMaxX, Mathf.Max(minY, prevShowMaxY + 1), showMaxY, levelCount);
+        }
+        else
+        {
+            ShowRangeRegion(minX, showMaxX, minY, showMaxY, levelCount);
+        }
+
+        prevShowMinX = minX;
+        prevShowMaxX = showMaxX;
+        prevShowMinY = minY;
+        prevShowMaxY = showMaxY;
+        hasPreviousShowRange = true;
+    }
+
+    private void ShowRangeRegion(int xMin, int xMax, int yMin, int yMax, int levelCount)
+    {
+        if (xMin > xMax || yMin > yMax) return;
+
+        for (var i = 0; i < terrainLayers.Count; i++)
+        {
+            var layer = terrainLayers[i];
+            var set = layer?.TileSet;
+            if (set == null || !layer.visible) continue;
+
+            for (var z = 0; z < levelCount; z++)
+            {
+                for (var y = yMin; y <= yMax; y++)
+                {
+                    for (var x = xMin; x <= xMax; x++)
+                    {
+                        if (set.UsesCornerLayout || HasCell(layer, x, y, z))
+                        {
+                            ShowTileAt(layer, i, z, x, y);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private void ShowTileAt(GameGridTerrainLayer layer, int layerIndex, int z, int x, int y)
+    {
+        var key = (layerIndex, z, x, y);
+        if (activeTileMap.ContainsKey(key)) return;
+
+        var selection = ResolveTileSelection(layer, z, x, y, out var anchor);
+        var sprite = selection.sprite;
+        if (sprite == null || sprite.texture == null) return;
+
+        var animated = selection.IsAnimated;
+        var pool = animated ? animatedTilePool : staticTilePool;
+        GameObject tileObject;
+        if (pool.Count > 0)
+        {
+            tileObject = pool[pool.Count - 1];
+            pool.RemoveAt(pool.Count - 1);
+            tileObject.SetActive(true);
+        }
+        else
+        {
+            tileObject = new GameObject(animated ? "__Grid_AnimatedTile" : "__Grid_Tile")
+            {
+                hideFlags = HideFlags.DontSave | HideFlags.HideInHierarchy,
+                layer = gameObject.layer
+            };
+            tileObject.transform.SetParent(transform, false);
+            if (animated) tileObject.AddComponent<GameGridAnimatedTile>();
+            tileObject.AddComponent<SpriteRenderer>();
+        }
+
+        RuntimeTile tile;
+        if (runtimeTilePool.Count > 0)
+        {
+            tile = runtimeTilePool[runtimeTilePool.Count - 1];
+            runtimeTilePool.RemoveAt(runtimeTilePool.Count - 1);
+        }
+        else
+        {
+            tile = new RuntimeTile();
+        }
+
+        tile.gameObject = tileObject;
+        tile.spriteRenderer = tileObject.GetComponent<SpriteRenderer>();
+        tile.animated = animated ? tileObject.GetComponent<GameGridAnimatedTile>() : null;
+        tile.layerIndex = layerIndex;
+        tile.z = z;
+        tile.x = x;
+        tile.y = y;
+        tile.outOfRangeTime = -1f;
+        ConfigureTile(tile, layer, z, x, y, selection, anchor);
+        activeTiles.Add(tile);
+        activeTileMap.Add(key, tile);
+    }
+
+    private GameGridTileSelection ResolveTileSelection(GameGridTerrainLayer layer, int z, int x, int y, out Vector2 anchor)
+    {
+        var set = layer.TileSet;
+        var mask = 0;
+        if (set.UsesCornerLayout)
+        {
+            if (HasCell(layer, x - 1, y - 1, z)) mask |= 1;
+            if (HasCell(layer, x, y - 1, z)) mask |= 2;
+            if (HasCell(layer, x - 1, y, z)) mask |= 4;
+            if (HasCell(layer, x, y, z)) mask |= 8;
+            anchor = IsIsometric
+                ? IsometricFromGrid(x, y, z)
+                : new Vector2(x * cellSize, y * cellSize);
+        }
+        else
+        {
+            if (HasCell(layer, x, y, z)) mask = GetBlobMask(x, y, z, layer);
+            anchor = IsIsometric
+                ? IsometricFromGrid(x + 0.5f, y + 0.5f, z)
+                : new Vector2((x + 0.5f) * cellSize, (y + 0.5f) * cellSize);
+        }
+
+        if (mask == 0) return default;
+        return set.Resolve(mask, new Vector2Int(x, y));
+    }
+
+    private void ConfigureTile(
+        RuntimeTile tile,
+        GameGridTerrainLayer layer,
+        int z,
+        int x,
+        int y,
+        GameGridTileSelection selection,
+        Vector2 anchor)
+    {
+        var sprite = selection.sprite;
+        var set = layer.TileSet;
+        var tileSize = GetTileSize();
+
+        var rect = sprite.rect;
+        var pivot = new Vector2(
+            sprite.pivot.x / Mathf.Max(1f, rect.width),
+            sprite.pivot.y / Mathf.Max(1f, rect.height));
+        var pivotOffset = new Vector2(
+            (pivot.x - 0.5f) * tileSize.x,
+            (pivot.y - 0.5f) * tileSize.y);
+
+        var bounds = sprite.bounds.size;
+        var tileTransform = tile.gameObject.transform;
+        tileTransform.localPosition = anchor + pivotOffset;
+        tileTransform.localScale = new Vector3(
+            tileSize.x / Mathf.Max(Epsilon, bounds.x),
+            tileSize.y / Mathf.Max(Epsilon, bounds.y),
+            1f);
+
+        var spriteRenderer = tile.spriteRenderer;
+        spriteRenderer.sprite = sprite;
+        spriteRenderer.color = set.tint;
+        spriteRenderer.sortingLayerID = ResolveSortingLayerId(layer.sortingLayerName);
+        spriteRenderer.sortingOrder = GetTileSortingOrder(layer, z, x, y);
+        spriteRenderer.shadowCastingMode = ShadowCastingMode.Off;
+        spriteRenderer.receiveShadows = false;
+
+        if (tile.animated != null)
+        {
+            if (set.materialTemplate != null) spriteRenderer.sharedMaterial = set.materialTemplate;
+            tile.animated.Setup(selection.animation);
+        }
+        else
+        {
+            spriteRenderer.sharedMaterial = ResolveTileMaterial(set, sprite.texture);
+        }
+    }
+
+    private int GetTileSortingOrder(GameGridTerrainLayer layer, int z, int x, int y)
+    {
+        if (!IsIsometric) return layer.sortingOrder + z;
+        var span = width + height + 2;
+        return (layer.sortingOrder + z) * span + GetSortDepth(x, y);
+    }
+
+    private Material ResolveTileMaterial(GameGridTileSet set, Texture2D texture)
+    {
+        var template = set.materialTemplate;
+        if (template != null && MaterialUsesTexture(template, texture)) return template;
+
+        if (!tileMaterialCache.TryGetValue(template, out var byTexture))
+        {
+            byTexture = new Dictionary<Texture2D, Material>();
+            tileMaterialCache.Add(template, byTexture);
+        }
+
+        if (byTexture.TryGetValue(texture, out var cached)) return cached;
+
+        var material = CreateMaterial(texture, template, out _);
+        byTexture.Add(texture, material);
+        return material;
+    }
+
+    private void RefreshTilesForCellChange(GameGridTerrainLayer layer, int x, int y, int z)
+    {
+        var layerIndex = GetLayerIndex(layer);
+        if (layerIndex < 0 || !IsLevelInBounds(z)) return;
+        var set = layer.TileSet;
+        if (set == null) return;
+
+        if (set.UsesCornerLayout)
+        {
+            var minX = Mathf.Max(0, x);
+            var maxX = Mathf.Min(width, x + 1);
+            var minY = Mathf.Max(0, y);
+            var maxY = Mathf.Min(height, y + 1);
+            for (var cy = minY; cy <= maxY; cy++)
+            {
+                for (var cx = minX; cx <= maxX; cx++)
+                    RefreshTileAt(layer, layerIndex, z, cx, cy);
+            }
+
+            return;
+        }
+
+        for (var cy = Mathf.Max(0, y - 1); cy <= Mathf.Min(height - 1, y + 1); cy++)
+        {
+            for (var cx = Mathf.Max(0, x - 1); cx <= Mathf.Min(width - 1, x + 1); cx++)
+                RefreshTileAt(layer, layerIndex, z, cx, cy);
+        }
+    }
+
+    private void RefreshTileAt(GameGridTerrainLayer layer, int layerIndex, int z, int x, int y)
+    {
+        var key = (layerIndex, z, x, y);
+        if (!activeTileMap.TryGetValue(key, out var tile))
+        {
+            if (hasRange &&
+                x >= rangeMinX && x <= rangeMaxX &&
+                y >= rangeMinY && y <= rangeMaxY)
+            {
+                ShowTileAt(layer, layerIndex, z, x, y);
+            }
+
+            return;
+        }
+
+        var selection = ResolveTileSelection(layer, z, x, y, out var anchor);
+        if (selection.sprite == null || selection.sprite.texture == null)
+        {
+            var tileIndex = activeTiles.IndexOf(tile);
+            if (tileIndex >= 0) RecycleTile(tileIndex);
+            return;
+        }
+
+        ConfigureTile(tile, layer, z, x, y, selection, anchor);
+        if (tile.outOfRangeTime >= 0f)
+        {
+            tile.outOfRangeTime = -1f;
+            pendingRecycleCount--;
+        }
+    }
+
+    private void ProcessTileRecycling()
+    {
+        if (pendingRecycleCount == 0) return;
+        var now = Time.time;
+        for (var i = activeTiles.Count - 1; i >= 0; i--)
+        {
+            if (activeTiles[i].outOfRangeTime < 0f) continue;
+            if (now - activeTiles[i].outOfRangeTime < tileRecycleDelay) continue;
+            RecycleTile(i);
+        }
+    }
+
+    private void RecycleAllTiles()
+    {
+        for (var i = activeTiles.Count - 1; i >= 0; i--)
+            RecycleTile(i);
+    }
+
+    private void RecycleTile(int index)
+    {
+        var tile = activeTiles[index];
+        activeTileMap.Remove((tile.layerIndex, tile.z, tile.x, tile.y));
+        // Swap-and-pop keeps recycling O(1); iteration order does not matter.
+        var last = activeTiles.Count - 1;
+        activeTiles[index] = activeTiles[last];
+        activeTiles.RemoveAt(last);
+
+        tile.gameObject.SetActive(false);
+        var pool = tile.animated != null ? animatedTilePool : staticTilePool;
+        if (pool.Count < MaxPooledTileObjects) pool.Add(tile.gameObject);
+        else DestroyGridObject(tile.gameObject);
+        tile.gameObject = null;
+        tile.spriteRenderer = null;
+        tile.animated = null;
+        runtimeTilePool.Add(tile);
+    }
+
+    private void ClearRuntimeTiles()
+    {
+        for (var i = activeTiles.Count - 1; i >= 0; i--)
+        {
+            var tile = activeTiles[i];
+            activeTileMap.Remove((tile.layerIndex, tile.z, tile.x, tile.y));
+            DestroyGridObject(tile.gameObject);
+        }
+
+        activeTiles.Clear();
+        activeTileMap.Clear();
+        runtimeTilePool.Clear();
+        pendingRecycleCount = 0;
+        hasPreviousShowRange = false;
+        DestroyPoolList(staticTilePool);
+        DestroyPoolList(animatedTilePool);
+        ClearTileMaterialCache();
+    }
+
+    private void DestroyPoolList(List<GameObject> pool)
+    {
+        for (var i = 0; i < pool.Count; i++)
+            DestroyGridObject(pool[i]);
+        pool.Clear();
+    }
+
+    private void ClearTileMaterialCache()
+    {
+        foreach (var pair in tileMaterialCache)
+        {
+            foreach (var materialPair in pair.Value)
+                DestroyGridObject(materialPair.Value);
+            pair.Value.Clear();
+        }
+
+        tileMaterialCache.Clear();
+    }
+
+    private static void DestroyGridObject(UnityEngine.Object target)
+    {
+        if (target == null) return;
+        if (Application.isPlaying) Destroy(target);
+        else DestroyImmediate(target);
+    }
+
     private sealed class MeshBuffers
     {
         public readonly List<Vector3> vertices = new List<Vector3>();
@@ -1203,5 +1762,17 @@ public sealed class GameGridRenderer : MonoBehaviour
         public Vector2 anchor;
         public int depth;
         public int diagonal;
+    }
+
+    private sealed class RuntimeTile
+    {
+        public GameObject gameObject;
+        public SpriteRenderer spriteRenderer;
+        public GameGridAnimatedTile animated;
+        public int layerIndex;
+        public int z;
+        public int x;
+        public int y;
+        public float outOfRangeTime;
     }
 }
